@@ -1,23 +1,26 @@
 """
 Service FastAPI de génération de PDFs pour livres de coloriage KDP
 Formats supportés: 5x8, 6x9, 8x10, 8.5x11 inches
-Version OPTIMISÉE avec téléchargements parallèles
+Version OPTIMISÉE avec téléchargements parallèles + Conversion SVG→PNG
 """
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel, HttpUrl
-from typing import List
+from pydantic import BaseModel, HttpUrl, Field
+from typing import List, Optional
 import httpx
+import requests
 import os
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.lib.pagesizes import inch
 from PIL import Image
 import io
+from io import BytesIO
 import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import cairosvg
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
@@ -25,11 +28,11 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="KDP PDF Generator",
-    description="Service de génération de PDFs pour livres de coloriage Amazon KDP - Version Optimisée",
-    version="3.6.0"
+    description="Service de génération de PDFs pour livres de coloriage Amazon KDP - Version Optimisée + SVG→PNG",
+    version="3.7.0"
 )
 
-# Formats KDP en inches → points (1 inch = 72 points)
+# Formats KDP en inches → points (1 inch = 72 points) pour PDF
 KDP_FORMATS = {
     "5x8": (5 * inch, 8 * inch),
     "6x9": (6 * inch, 9 * inch),
@@ -37,8 +40,28 @@ KDP_FORMATS = {
     "8.5x11": (8.5 * inch, 11 * inch)
 }
 
+# Formats KDP en inches pour conversion SVG→PNG
+KDP_FORMATS_INCHES = {
+    "A4": (8.27, 11.69),
+    "a4": (8.27, 11.69),
+    "8.5x11": (8.5, 11.0),
+    "8.5X11": (8.5, 11.0),
+    "LETTER": (8.5, 11.0),
+    "6x9": (6.0, 9.0),
+    "5x8": (5.0, 8.0),
+    "5.5x8.5": (5.5, 8.5),
+    "7x10": (7.0, 10.0),
+    "8x10": (8.0, 10.0),
+    "8.5x8.5": (8.5, 8.5),
+}
+
 # Configuration pour téléchargements parallèles
 MAX_CONCURRENT_DOWNLOADS = 10  # Nombre de téléchargements simultanés
+
+
+# =============================================================================
+# MODÈLES DE REQUÊTE
+# =============================================================================
 
 class PDFRequest(BaseModel):
     """Modèle de requête pour la génération de PDF"""
@@ -51,6 +74,41 @@ class PDFRequest(BaseModel):
     include_ownership_page: bool = False
     include_copyright_page: bool = False
     include_notice_page: bool = False
+
+
+class SVGToPNGRequest(BaseModel):
+    """Modèle de requête pour la conversion SVG→PNG"""
+    book_id: str
+    image_number: str
+    format: str
+    svg_url: str
+    dpi: Optional[int] = 300
+    margins_mm: Optional[float] = 0
+
+
+# =============================================================================
+# FONCTIONS UTILITAIRES
+# =============================================================================
+
+def get_format_dimensions(format_str: str, dpi: int = 300):
+    """Calcule les dimensions en pixels pour un format KDP donné"""
+    format_clean = format_str.strip().upper().replace(",", ".").replace(" ", "")
+    
+    for key, (w, h) in KDP_FORMATS_INCHES.items():
+        if key.upper() == format_clean:
+            return int(w * dpi), int(h * dpi)
+    
+    # Parsing manuel
+    if "X" in format_clean:
+        try:
+            parts = format_clean.split("X")
+            return int(float(parts[0]) * dpi), int(float(parts[1]) * dpi)
+        except:
+            pass
+    
+    # Défaut A4
+    return int(8.27 * dpi), int(11.69 * dpi)
+
 
 async def download_image_async(url: str, index: int, timeout: int = 30) -> tuple[int, bytes]:
     """
@@ -97,6 +155,7 @@ async def download_image_async(url: str, index: int, timeout: int = 30) -> tuple
             detail=f"Image {index}: Erreur lors du téléchargement: {str(e)}"
         )
 
+
 async def download_images_parallel(urls: List[str]) -> List[bytes]:
     """
     Télécharge plusieurs images en parallèle
@@ -128,6 +187,11 @@ async def download_images_parallel(urls: List[str]) -> List[bytes]:
     
     logger.info(f"✓ Tous les téléchargements terminés")
     return images_data
+
+
+# =============================================================================
+# FONCTIONS PAGES PDF
+# =============================================================================
 
 def add_title_page(c: canvas.Canvas, title: str, author: str, width: float, height: float):
     """Ajoute une page de titre"""
@@ -163,6 +227,7 @@ def add_title_page(c: canvas.Canvas, title: str, author: str, width: float, heig
     c.setLineWidth(2)
     c.line(width * 0.2, height * 0.35, width * 0.8, height * 0.35)
 
+
 def add_ownership_page(c: canvas.Canvas, width: float, height: float):
     """Ajoute une page "Ce livre appartient à" """
     c.setFont("Helvetica-Bold", 24)
@@ -176,6 +241,7 @@ def add_ownership_page(c: canvas.Canvas, width: float, height: float):
     for i in range(3):
         y = line_y - (i * 50)
         c.line(line_x_start, y, line_x_start + line_width, y)
+
 
 def add_copyright_page(c: canvas.Canvas, author: str, width: float, height: float):
     """Ajoute une page de copyright"""
@@ -199,6 +265,7 @@ def add_copyright_page(c: canvas.Canvas, author: str, width: float, height: floa
     
     for i, line in enumerate(text_lines):
         c.drawCentredString(width / 2, text_y - 40 - (i * 15), line)
+
 
 def add_notice_page(c: canvas.Canvas, width: float, height: float):
     """Ajoute une page d'avis important"""
@@ -226,6 +293,7 @@ def add_notice_page(c: canvas.Canvas, width: float, height: float):
     text_y = height * 0.6
     for i, line in enumerate(text_lines):
         c.drawCentredString(width / 2, text_y - (i * 20), line)
+
 
 def create_pdf(images_data: List[bytes], request: PDFRequest) -> bytes:
     """
@@ -339,20 +407,27 @@ def create_pdf(images_data: List[bytes], request: PDFRequest) -> bytes:
             detail=f"Erreur lors de la création du PDF: {str(e)}"
         )
 
+
+# =============================================================================
+# ENDPOINTS
+# =============================================================================
+
 @app.get("/")
 async def root():
     """Endpoint racine - Informations sur l'API"""
     return {
         "service": "KDP PDF Generator",
-        "version": "3.6.0 (Optimisé)",
+        "version": "3.7.0 (Optimisé + SVG→PNG)",
         "status": "operational",
-        "features": "Téléchargements parallèles",
+        "features": ["Téléchargements parallèles", "Conversion SVG→PNG"],
         "formats_supported": list(KDP_FORMATS.keys()),
         "endpoints": {
             "health": "/health",
-            "generate": "/generate-pdf (POST)"
+            "generate": "/generate-pdf (POST)",
+            "svg_to_png": "/svg_to_png (POST)"
         }
     }
+
 
 @app.get("/health")
 async def health_check():
@@ -360,9 +435,10 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "KDP PDF Generator",
-        "version": "3.6.0",
+        "version": "3.7.0",
         "formats_available": list(KDP_FORMATS.keys())
     }
+
 
 @app.post("/generate-pdf")
 async def generate_pdf(request: PDFRequest):
@@ -440,6 +516,68 @@ async def generate_pdf(request: PDFRequest):
         logger.error(f"Erreur inattendue: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {str(e)}")
 
+
+@app.post("/svg_to_png")
+async def svg_to_png(request: SVGToPNGRequest):
+    """Convertit un SVG en PNG 300 DPI au format KDP"""
+    
+    logger.info(f"🎨 SVG→PNG: {request.book_id}_{request.image_number}")
+    
+    try:
+        # 1. Télécharger le SVG
+        response = requests.get(request.svg_url, timeout=60, allow_redirects=True)
+        if response.status_code != 200:
+            raise HTTPException(400, f"Erreur téléchargement SVG: {response.status_code}")
+        
+        svg_content = response.content
+        
+        # 2. Calculer dimensions
+        width_px, height_px = get_format_dimensions(request.format, request.dpi)
+        
+        # 3. Convertir SVG → PNG
+        png_data = cairosvg.svg2png(
+            bytestring=svg_content,
+            output_width=width_px,
+            output_height=height_px,
+            dpi=request.dpi
+        )
+        
+        # 4. Optimiser (RGBA → RGB avec fond blanc)
+        img = Image.open(BytesIO(png_data))
+        if img.mode == 'RGBA':
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[3])
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        output = BytesIO()
+        img.save(output, format='PNG', optimize=True)
+        final_png = output.getvalue()
+        
+        # 5. Retourner le PNG
+        filename = f"{request.book_id}_{request.image_number}_KDP.png"
+        
+        logger.info(f"✅ SVG→PNG terminé: {filename} ({img.size[0]}x{img.size[1]} @ {request.dpi} DPI)")
+        
+        return Response(
+            content=final_png,
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Image-Width": str(img.size[0]),
+                "X-Image-Height": str(img.size[1]),
+                "X-Image-DPI": str(request.dpi)
+            }
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Erreur SVG→PNG: {e}")
+        raise HTTPException(500, str(e))
+
+
 @app.get("/formats")
 async def get_formats():
     """Retourne la liste des formats KDP supportés avec leurs dimensions"""
@@ -460,6 +598,7 @@ async def get_formats():
             for name, (width, height) in KDP_FORMATS.items()
         }
     }
+
 
 if __name__ == "__main__":
     import uvicorn
