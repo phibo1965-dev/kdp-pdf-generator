@@ -39,17 +39,22 @@ def epaissir(g0: np.ndarray, trait_min=0.40, seuil=200, hauteur_in=11.0, up=2, s
 
     # 2. binarisation + suppression de la poussiere
     ink = g < seuil
+    del g
     ink = _retirer_poussiere(ink, int(0.05 / mm / mm))
 
     # 3. re-trace des seuls traits trop fins
     sk = skeletonize(ink)
     dt = cv2.distanceTransform(ink.astype(np.uint8), cv2.DIST_L2, 5)
-    fins = sk & (2 * dt * mm < trait_min)
+    fins = sk & (dt < trait_min / 2 / mm)  # equivalent a 2*dt*mm < trait_min
+    del sk, dt
     d = cv2.distanceTransform((~fins).astype(np.uint8), cv2.DIST_L2, 5)
+    del fins
     out = ink | (d <= (trait_min / 2) / mm)
+    del ink, d
 
     # 4. bords anti-aliases
     img = np.where(out, 0, 255).astype(np.uint8)
+    del out
     img = cv2.GaussianBlur(img, (0, 0), up * 0.6)
     if sortie_x == 1:
         img = cv2.resize(img, (g0.shape[1], g0.shape[0]), interpolation=cv2.INTER_AREA)

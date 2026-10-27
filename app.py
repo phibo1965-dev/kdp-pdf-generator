@@ -596,15 +596,21 @@ async def thicken(
     logger.info(f"🖊️ Thicken: {nom}")
     data = await file.read()
     g0 = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+    del data
     if g0 is None:
-        raise HTTPException(400, f"Image illisible ({len(data)} octets recus)")
+        raise HTTPException(400, "Image illisible (fichier vide, corrompu ou pas une image)")
     if sortie_x not in (1, 2):
         raise HTTPException(400, "sortie_x doit valoir 1 ou 2")
     try:
         loop = asyncio.get_running_loop()
         img = await loop.run_in_executor(
             None, lambda: epaissir(g0, trait_min, seuil, hauteur_in, 2, sortie_x))
-        m = await loop.run_in_executor(None, lambda: mesurer(img, hauteur_in))
+        # mesures toujours a la taille d'origine : comparables a la cible validee
+        # (moins de memoire, et memes chiffres que sortie_x=1)
+        img_mes = img if sortie_x == 1 else cv2.resize(
+            img, (g0.shape[1], g0.shape[0]), interpolation=cv2.INTER_AREA)
+        m = await loop.run_in_executor(None, lambda: mesurer(img_mes, hauteur_in))
+        del img_mes
 
         dpi = round(img.shape[0] / hauteur_in)
         buf = BytesIO()

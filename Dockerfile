@@ -4,6 +4,12 @@ FROM python:3.11-slim
 # Définir le répertoire de travail
 WORKDIR /app
 
+# Bibliothèques système : libcairo2 pour cairosvg (/svg_to_png),
+# libglib2.0-0 par sécurité pour OpenCV (/thicken)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libcairo2 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copier les fichiers de dépendances
 COPY requirements.txt .
 
