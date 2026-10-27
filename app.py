@@ -4,7 +4,7 @@ Formats supportés: 5x8, 6x9, 8x10, 8.5x11 inches
 Version OPTIMISÉE avec téléchargements parallèles + Conversion SVG→PNG
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
 from pydantic import BaseModel, HttpUrl, Field
 from typing import List, Optional
@@ -21,6 +21,9 @@ import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import cairosvg
+import numpy as np
+import cv2
+from thicken import epaissir, mesurer
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
@@ -424,7 +427,8 @@ async def root():
         "endpoints": {
             "health": "/health",
             "generate": "/generate-pdf (POST)",
-            "svg_to_png": "/svg_to_png (POST)"
+            "svg_to_png": "/svg_to_png (POST)",
+            "thicken": "/thicken (POST, multipart)"
         }
     }
 
@@ -575,6 +579,55 @@ async def svg_to_png(request: SVGToPNGRequest):
         raise
     except Exception as e:
         logger.error(f"❌ Erreur SVG→PNG: {e}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/thicken")
+async def thicken(
+    file: UploadFile = File(...),
+    nom: str = Form("page"),
+    trait_min: float = Form(0.40),
+    seuil: int = Form(200),
+    hauteur_in: float = Form(11.0),
+    sortie_x: int = Form(2),
+):
+    """OBSIDIAN A4 : epaississement selectif d'une page raster (JPEG/PNG).
+    Renvoie un PNG + mesures QA dans les en-tetes X-QA-*."""
+    logger.info(f"🖊️ Thicken: {nom}")
+    data = await file.read()
+    g0 = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_GRAYSCALE)
+    if g0 is None:
+        raise HTTPException(400, f"Image illisible ({len(data)} octets recus)")
+    if sortie_x not in (1, 2):
+        raise HTTPException(400, "sortie_x doit valoir 1 ou 2")
+    try:
+        loop = asyncio.get_running_loop()
+        img = await loop.run_in_executor(
+            None, lambda: epaissir(g0, trait_min, seuil, hauteur_in, 2, sortie_x))
+        m = await loop.run_in_executor(None, lambda: mesurer(img, hauteur_in))
+
+        dpi = round(img.shape[0] / hauteur_in)
+        buf = BytesIO()
+        Image.fromarray(img).save(buf, format="PNG", optimize=True, dpi=(dpi, dpi))
+        filename = f"{nom}_A4.png"
+        logger.info(f"✅ Thicken terminé: {filename} {img.shape[1]}x{img.shape[0]} {m}")
+        return Response(
+            content=buf.getvalue(),
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Image-Width": str(img.shape[1]),
+                "X-Image-Height": str(img.shape[0]),
+                "X-Image-DPI": str(dpi),
+                "X-QA-Zones": str(m["zones"]),
+                "X-QA-Micro-Zones": str(m["micro_zones"]),
+                "X-QA-Encre-Pct": str(m["encre_pct"]),
+                "X-QA-Trait-Moyen-mm": str(m["trait_moyen_mm"]),
+                "X-QA-Trait-Fin-Pct": str(m["trait_fin_pct"]),
+            },
+        )
+    except Exception as e:
+        logger.error(f"❌ Erreur thicken: {e}")
         raise HTTPException(500, str(e))
 
 
