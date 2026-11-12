@@ -77,6 +77,12 @@ class PDFRequest(BaseModel):
     include_ownership_page: bool = False
     include_copyright_page: bool = False
     include_notice_page: bool = False
+    # --- Mise en page KDP (OBSIDIAN, nov. 2026) ---
+    recto_only: bool = True           # page blanche apres chaque dessin (feutres)
+    hauteur_dessin_in: float = 10.0   # hauteur imprimee du dessin = hauteur_in de /thicken
+    marge_ext_in: float = 0.375       # marge exterieure (KDP mini 0,25 sans fond perdu)
+    marge_haut_in: float = 0.375      # marge du haut
+    numeroter: bool = True            # numero de page sous le dessin, hors du dessin
 
 
 class SVGToPNGRequest(BaseModel):
@@ -298,6 +304,19 @@ def add_notice_page(c: canvas.Canvas, width: float, height: float):
         c.drawCentredString(width / 2, text_y - (i * 20), line)
 
 
+def gouttiere_kdp(nb_pages: int) -> float:
+    """Marge interieure KDP (pouces) selon le nombre total de pages."""
+    if nb_pages <= 150:
+        return 0.375
+    if nb_pages <= 300:
+        return 0.5
+    if nb_pages <= 500:
+        return 0.625
+    if nb_pages <= 700:
+        return 0.75
+    return 0.875
+
+
 def create_pdf(images_data: List[bytes], request: PDFRequest) -> bytes:
     """
     Crée un PDF à partir d'une liste d'images
@@ -351,51 +370,71 @@ def create_pdf(images_data: List[bytes], request: PDFRequest) -> bytes:
             page_number += 1
         
         # Images de coloriage
-        for idx, img_data in enumerate(images_data, 1):
-            logger.info(f"Traitement de l'image {idx}/{len(images_data)}")
-            
-            img = Image.open(io.BytesIO(img_data))
-            
+        nb_front = page_number - 1
+        nb_img = len(images_data)
+        # premier dessin sur une page impaire (recto) : page blanche si besoin
+        pad = 1 if (request.recto_only and page_number % 2 == 0) else 0
+        nb_pages = nb_front + pad + (2 * nb_img - 1 if request.recto_only else nb_img)
+        gout = gouttiere_kdp(nb_pages) * inch
+        ext = request.marge_ext_in * inch
+        haut = request.marge_haut_in * inch
+        h_cible = request.hauteur_dessin_in * inch
+        bas = page_height - haut - h_cible
+        if bas < 0.25 * inch + (0.3 * inch if request.numeroter else 0):
+            raise ValueError(f"hauteur_dessin_in trop grande : marge du bas {bas / inch:.2f} in")
+        logger.info(f"Mise en page : {nb_pages} pages, gouttiere {gout / inch} in, "
+                    f"dessin {request.hauteur_dessin_in} in de haut, recto seul={request.recto_only}")
+        if pad:
+            c.showPage()
+            page_number += 1
+
+        for idx in range(nb_img):
+            logger.info(f"Traitement de l'image {idx + 1}/{nb_img}")
+            img = Image.open(io.BytesIO(images_data[idx]))
+            images_data[idx] = None  # liberer la memoire au fur et a mesure
+
             if img.mode in ('RGBA', 'LA', 'P'):
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 if img.mode == 'P':
                     img = img.convert('RGBA')
-                if img.mode in ('RGBA', 'LA'):
-                    background.paste(img, mask=img.split()[-1])
-                else:
-                    background.paste(img)
+                background.paste(img, mask=img.split()[-1])
                 img = background
-            elif img.mode != 'RGB':
+            if img.mode not in ('L', 'RGB'):
                 img = img.convert('RGB')
-            
-            img_width, img_height = img.size
-            aspect_ratio = img_width / img_height
-            page_aspect_ratio = page_width / page_height
-            
-            if aspect_ratio > page_aspect_ratio:
-                draw_width = page_width
-                draw_height = page_width / aspect_ratio
+
+            # page impaire = recto : reliure a gauche ; page paire : reliure a droite
+            if page_number % 2 == 1:
+                zone_x, zone_w = gout, page_width - gout - ext
             else:
-                draw_height = page_height
-                draw_width = page_height * aspect_ratio
-            
-            x = (page_width - draw_width) / 2
-            y = (page_height - draw_height) / 2
-            
+                zone_x, zone_w = ext, page_width - gout - ext
+
+            ratio = img.width / img.height
+            draw_height = h_cible
+            draw_width = draw_height * ratio
+            if draw_width > zone_w:  # image trop large : on reduit (signale)
+                logger.warning(f"Image {idx + 1} trop large, reduite a la largeur utile")
+                draw_width = zone_w
+                draw_height = draw_width / ratio
+            x = zone_x + (zone_w - draw_width) / 2
+            y = bas + (h_cible - draw_height)  # dessin colle a la marge du haut
+
             img_buffer = io.BytesIO()
             img.save(img_buffer, format='JPEG', quality=95)
+            del img
             img_buffer.seek(0)
-            img_reader = ImageReader(img_buffer)
-            
-            c.drawImage(img_reader, x, y, width=draw_width, height=draw_height)
-            
-            c.setFont("Helvetica", 10)
-            c.drawCentredString(page_width / 2, 0.5 * inch, str(page_number))
-            
-            if idx < len(images_data):
+            c.drawImage(ImageReader(img_buffer), x, y, width=draw_width, height=draw_height)
+
+            if request.numeroter:
+                c.setFont("Helvetica", 10)
+                c.drawCentredString(zone_x + zone_w / 2, 0.35 * inch, str(page_number))
+
+            if idx < nb_img - 1:
                 c.showPage()
                 page_number += 1
-        
+                if request.recto_only:  # verso blanc
+                    c.showPage()
+                    page_number += 1
+
         c.save()
         
         pdf_bytes = pdf_buffer.getvalue()
@@ -510,7 +549,9 @@ async def generate_pdf(request: PDFRequest):
             content=pdf_bytes,
             media_type='application/pdf',
             headers={
-                'Content-Disposition': f'attachment; filename="{request.book_id}.pdf"'
+                'Content-Disposition': f'attachment; filename="{request.book_id}.pdf"',
+                'X-PDF-Recto-Seul': str(request.recto_only),
+                'X-PDF-Hauteur-Dessin-In': str(request.hauteur_dessin_in),
             }
         )
         
