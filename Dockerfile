@@ -19,6 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copier le code de l'application
 COPY app.py .
 COPY thicken.py .
+COPY pages_debut.py .
+COPY fonts ./fonts
 
 # Exposer le port (Render.com définira automatiquement PORT)
 EXPOSE 8000

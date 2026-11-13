@@ -24,6 +24,8 @@ import cairosvg
 import numpy as np
 import cv2
 from thicken import epaissir, mesurer
+import pages_debut
+import datetime as _dt
 
 # Configuration du logging
 logging.basicConfig(level=logging.INFO)
@@ -83,6 +85,17 @@ class PDFRequest(BaseModel):
     marge_ext_in: float = 0.375       # marge exterieure (KDP mini 0,25 sans fond perdu)
     marge_haut_in: float = 0.375      # marge du haut
     numeroter: bool = True            # numero de page sous le dessin, hors du dessin
+    # --- Pages de debut v2 multilingues (OBSIDIAN, 13 nov. 2026) ---
+    # si 'langues' est rempli : 4 pages v2 (titre, copyright, appartient+avis, essai couleurs)
+    # et les anciens include_* sont ignores. langues[0] = langue principale (anglais).
+    langues: List[dict] = []
+    collection: str = "OBSIDIAN"
+    subtitle: str = ""
+    year: str = ""
+    d_number: str = ""
+    font_title: str = ""      # famille dans fonts/ (ex. CinzelDecorative) ; vide = NotoSerif
+    font_text: str = ""       # vide = NotoSerif
+    font_fallback: str = ""   # vide = NotoSans (langues non couvertes)
 
 
 class SVGToPNGRequest(BaseModel):
@@ -317,7 +330,7 @@ def gouttiere_kdp(nb_pages: int) -> float:
     return 0.875
 
 
-def create_pdf(images_data: List[bytes], request: PDFRequest) -> bytes:
+def create_pdf(images_data: List[bytes], request: PDFRequest):
     """
     Crée un PDF à partir d'une liste d'images
     
@@ -340,30 +353,51 @@ def create_pdf(images_data: List[bytes], request: PDFRequest) -> bytes:
         logger.info(f"Création PDF format {format_name}: {page_width}x{page_height} points")
         
         pdf_buffer = io.BytesIO()
-        c = canvas.Canvas(pdf_buffer, pagesize=(page_width, page_height))
+        init_font = pages_debut.police_initiale() if request.langues else "Helvetica"
+        c = canvas.Canvas(pdf_buffer, pagesize=(page_width, page_height), initialFontName=init_font)
         
         page_number = 1
-        
-        # Pages supplémentaires
-        if request.include_title_page and request.title:
+        info = {"pct": "", "polices": "Helvetica (non integree)", "avert": ""}
+        police_num = "Helvetica"
+
+        if request.langues:
+            # ---- pages de debut v2 : 4 pages, polices integrees
+            nb_img = len(images_data)
+            nb_total = 4 + (2 * nb_img - 1 if request.recto_only else nb_img)
+            g_v2 = gouttiere_kdp(nb_total) * inch
+            ext_v2 = request.marge_ext_in * inch
+            def zone(n):
+                if n % 2 == 1:
+                    return g_v2, page_width - g_v2 - ext_v2
+                return ext_v2, page_width - g_v2 - ext_v2
+            if not request.year:
+                request.year = str(_dt.date.today().year)
+            nb, pct, pol = pages_debut.generer(c, request, page_width, page_height, zone)
+            page_number += nb
+            police_num = pol.texte["Regular"]
+            info = {"pct": str(pct), "polices": pol.utilisees(),
+                    "avert": " ; ".join(pol.avertissements)}
+
+        # Pages supplémentaires (ancien format, si langues vide)
+        if request.include_title_page and request.title and not request.langues:
             logger.info("Ajout de la page de titre")
             add_title_page(c, request.title, request.author, page_width, page_height)
             c.showPage()
             page_number += 1
         
-        if request.include_ownership_page:
+        if request.include_ownership_page and not request.langues:
             logger.info("Ajout de la page d'appartenance")
             add_ownership_page(c, page_width, page_height)
             c.showPage()
             page_number += 1
         
-        if request.include_copyright_page:
+        if request.include_copyright_page and not request.langues:
             logger.info("Ajout de la page de copyright")
             add_copyright_page(c, request.author, page_width, page_height)
             c.showPage()
             page_number += 1
         
-        if request.include_notice_page:
+        if request.include_notice_page and not request.langues:
             logger.info("Ajout de la page d'avis important")
             add_notice_page(c, page_width, page_height)
             c.showPage()
@@ -425,7 +459,7 @@ def create_pdf(images_data: List[bytes], request: PDFRequest) -> bytes:
             c.drawImage(ImageReader(img_buffer), x, y, width=draw_width, height=draw_height)
 
             if request.numeroter:
-                c.setFont("Helvetica", 10)
+                c.setFont(police_num, 10)
                 c.drawCentredString(zone_x + zone_w / 2, 0.35 * inch, str(page_number))
 
             if idx < nb_img - 1:
@@ -440,7 +474,7 @@ def create_pdf(images_data: List[bytes], request: PDFRequest) -> bytes:
         pdf_bytes = pdf_buffer.getvalue()
         logger.info(f"PDF créé avec succès: {len(pdf_bytes)} bytes, {page_number} pages")
         
-        return pdf_bytes
+        return pdf_bytes, info
         
     except Exception as e:
         logger.error(f"Erreur lors de la création du PDF: {str(e)}")
@@ -532,7 +566,7 @@ async def generate_pdf(request: PDFRequest):
         
         # Générer le PDF
         pdf_start = time.time()
-        pdf_bytes = create_pdf(images_data, request)
+        pdf_bytes, info = create_pdf(images_data, request)
         pdf_time = time.time() - pdf_start
         
         total_time = time.time() - start_time
@@ -552,6 +586,9 @@ async def generate_pdf(request: PDFRequest):
                 'Content-Disposition': f'attachment; filename="{request.book_id}.pdf"',
                 'X-PDF-Recto-Seul': str(request.recto_only),
                 'X-PDF-Hauteur-Dessin-In': str(request.hauteur_dessin_in),
+                'X-PDF-Langue-Principale-Pct': info["pct"],
+                'X-PDF-Polices': info["polices"],
+                'X-PDF-Avertissements': info["avert"].encode("ascii", "replace").decode()[:900],
             }
         )
         
