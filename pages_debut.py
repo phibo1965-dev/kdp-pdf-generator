@@ -92,6 +92,38 @@ def _centre(c, pol, famille, texte, cx, y, taille, gras=False, couleur=black, la
     return y
 
 
+def _titre_equilibre(pol, famille, texte, larg_max, taille_max=34, taille_min=22):
+    """Choisit 1, 2 ou 3 lignes et la taille : une seule ligne si elle tient,
+    sinon coupure qui equilibre les longueurs (pas de mot seul sur la 2e ligne).
+    Renvoie (police, taille, lignes)."""
+    ps = pol.choisir(famille, texte, True)
+    mots = texte.split()
+    larg = lambda t, z: pdfmetrics.stringWidth(t, ps, z)
+    for nb in (1, 2, 3):
+        taille = taille_max
+        while taille >= taille_min:
+            if nb == 1:
+                if larg(texte, taille) <= larg_max:
+                    return ps, taille, [texte]
+            else:
+                meilleur = None
+                n = len(mots)
+                coupes = ([(i,) for i in range(1, n)] if nb == 2 else
+                          [(i, j) for i in range(1, n - 1) for j in range(i + 1, n)])
+                for c in coupes:
+                    bornes = (0,) + c + (n,)
+                    lignes = [" ".join(mots[bornes[k]:bornes[k + 1]]) for k in range(nb)]
+                    w = max(larg(l, taille) for l in lignes)
+                    if w <= larg_max and (meilleur is None or w < meilleur[0]):
+                        meilleur = (w, lignes)
+                if meilleur:
+                    return ps, taille, meilleur[1]
+            taille -= 2
+            if nb == 1 and taille < 28:   # au-dela, on prefere 2 lignes en grand
+                break
+    return ps, taille_min, simpleSplit(texte, ps, taille_min, larg_max)
+
+
 def _paragraphes(c, pol, famille, texte, cx, y, taille, larg, couleur=black):
     for para in [p.strip() for p in texte.split("\n")]:
         if not para:
@@ -133,7 +165,11 @@ def generer(c, req, page_w, page_h, zone):
     _centre(c, pol, pol.titre, req.collection.upper(), cx, y, 16, gras=True)
     _ornement(c, cx, y - 18, w * 0.18)
     y = page_h * 0.60
-    y = _centre(c, pol, pol.titre, req.title, cx, y, 34, gras=True, larg_max=w * 0.85)
+    ps_t, taille_t, lignes_t = _titre_equilibre(pol, pol.titre, req.title, w * 0.85)
+    for ligne in lignes_t:
+        c.setFont(ps_t, taille_t)
+        c.drawCentredString(cx, y, ligne)
+        y -= taille_t * 1.35
     if req.subtitle:
         y = _centre(c, pol, pol.texte, req.subtitle, cx, y - 10, 15, larg_max=w * 0.8)
     _ornement(c, cx, y - 14, w * 0.25)
