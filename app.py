@@ -1,13 +1,13 @@
 """
 Service FastAPI de génération de PDFs pour livres de coloriage KDP
 Formats supportés: 5x8, 6x9, 8x10, 8.5x11 inches
-Version OPTIMISÉE avec téléchargements parallèles + Conversion SVG→PNG
+v3.9.0 (14 nov. 2026) : code mort retire (/svg_to_png, cairosvg, anciennes pages Helvetica)
 """
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
-from pydantic import BaseModel, HttpUrl, Field
-from typing import List, Optional
+from pydantic import BaseModel, HttpUrl
+from typing import List
 import requests
 import os
 from reportlab.pdfgen import canvas
@@ -22,7 +22,6 @@ from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 import gc
 import resource
-import cairosvg
 import numpy as np
 import cv2
 from thicken import epaissir, mesurer
@@ -35,8 +34,8 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="KDP PDF Generator",
-    description="Service de génération de PDFs pour livres de coloriage Amazon KDP - Version Optimisée + SVG→PNG",
-    version="3.8.0"
+    description="Service de génération de PDFs pour livres de coloriage Amazon KDP (OBSIDIAN)",
+    version="3.9.0"
 )
 
 # Formats KDP en inches → points (1 inch = 72 points) pour PDF
@@ -45,21 +44,6 @@ KDP_FORMATS = {
     "6x9": (6 * inch, 9 * inch),
     "8x10": (8 * inch, 10 * inch),
     "8.5x11": (8.5 * inch, 11 * inch)
-}
-
-# Formats KDP en inches pour conversion SVG→PNG
-KDP_FORMATS_INCHES = {
-    "A4": (8.27, 11.69),
-    "a4": (8.27, 11.69),
-    "8.5x11": (8.5, 11.0),
-    "8.5X11": (8.5, 11.0),
-    "LETTER": (8.5, 11.0),
-    "6x9": (6.0, 9.0),
-    "5x8": (5.0, 8.0),
-    "5.5x8.5": (5.5, 8.5),
-    "7x10": (7.0, 10.0),
-    "8x10": (8.0, 10.0),
-    "8.5x8.5": (8.5, 8.5),
 }
 
 # Telechargement au fil de l'eau (v3.8.0, 14 nov. 2026) : au plus PREFETCH images
@@ -77,11 +61,7 @@ class PDFRequest(BaseModel):
     book_id: str
     format: str = "8.5x11"
     title: str = ""
-    author: str = "Xavier Legrand"
-    include_title_page: bool = False
-    include_ownership_page: bool = False
-    include_copyright_page: bool = False
-    include_notice_page: bool = False
+    author: str = ""                  # obligatoire (Collection_DNA M AUTEUR, lu par A8)
     # --- Mise en page KDP (OBSIDIAN, nov. 2026) ---
     recto_only: bool = True           # page blanche apres chaque dessin (feutres)
     hauteur_dessin_in: float = 10.0   # hauteur imprimee du dessin = hauteur_in de /thicken
@@ -91,8 +71,8 @@ class PDFRequest(BaseModel):
     dpi_impression: int = 300         # resolution integree au PDF (KDP : 300 ppp)
     niveaux_de_gris: bool = True      # dessins integres en gris (3x plus leger que RGB)
     # --- Pages de debut v2 multilingues (OBSIDIAN, 13 nov. 2026) ---
-    # si 'langues' est rempli : 4 pages v2 (titre, copyright, appartient+avis, essai couleurs)
-    # et les anciens include_* sont ignores. langues[0] = langue principale (anglais).
+    # obligatoire : 4 pages v2 (titre, copyright, appartient+avis, essai couleurs).
+    # langues[0] = langue principale (anglais).
     langues: List[dict] = []
     collection: str = "OBSIDIAN"
     subtitle: str = ""
@@ -103,39 +83,9 @@ class PDFRequest(BaseModel):
     font_fallback: str = ""   # vide = NotoSans (langues non couvertes)
 
 
-class SVGToPNGRequest(BaseModel):
-    """Modèle de requête pour la conversion SVG→PNG"""
-    book_id: str
-    image_number: str
-    format: str
-    svg_url: str
-    dpi: Optional[int] = 300
-    margins_mm: Optional[float] = 0
-
-
 # =============================================================================
 # FONCTIONS UTILITAIRES
 # =============================================================================
-
-def get_format_dimensions(format_str: str, dpi: int = 300):
-    """Calcule les dimensions en pixels pour un format KDP donné"""
-    format_clean = format_str.strip().upper().replace(",", ".").replace(" ", "")
-    
-    for key, (w, h) in KDP_FORMATS_INCHES.items():
-        if key.upper() == format_clean:
-            return int(w * dpi), int(h * dpi)
-    
-    # Parsing manuel
-    if "X" in format_clean:
-        try:
-            parts = format_clean.split("X")
-            return int(float(parts[0]) * dpi), int(float(parts[1]) * dpi)
-        except:
-            pass
-    
-    # Défaut A4
-    return int(8.27 * dpi), int(11.69 * dpi)
-
 
 def telecharger_image(url: str, index: int, timeout: int = 60) -> bytes:
     """Telecharge une image (synchrone, appele depuis un fil du pool)."""
@@ -158,112 +108,6 @@ def telecharger_image(url: str, index: int, timeout: int = 60) -> bytes:
 def memoire_max_mo() -> int:
     """Pic de memoire du processus depuis son demarrage (Linux : ru_maxrss en Ko)."""
     return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
-
-
-# =============================================================================
-# FONCTIONS PAGES PDF
-# =============================================================================
-
-def add_title_page(c: canvas.Canvas, title: str, author: str, width: float, height: float):
-    """Ajoute une page de titre"""
-    c.setFont("Helvetica-Bold", 28)
-    title_y = height * 0.55
-    
-    max_width = width * 0.8
-    if c.stringWidth(title, "Helvetica-Bold", 28) > max_width:
-        words = title.split()
-        lines = []
-        current_line = []
-        
-        for word in words:
-            test_line = ' '.join(current_line + [word])
-            if c.stringWidth(test_line, "Helvetica-Bold", 28) <= max_width:
-                current_line.append(word)
-            else:
-                if current_line:
-                    lines.append(' '.join(current_line))
-                current_line = [word]
-        
-        if current_line:
-            lines.append(' '.join(current_line))
-        
-        for i, line in enumerate(lines):
-            c.drawCentredString(width / 2, title_y - (i * 35), line)
-    else:
-        c.drawCentredString(width / 2, title_y, title)
-    
-    c.setFont("Helvetica", 18)
-    c.drawCentredString(width / 2, height * 0.40, f"Par {author}")
-    
-    c.setLineWidth(2)
-    c.line(width * 0.2, height * 0.35, width * 0.8, height * 0.35)
-
-
-def add_ownership_page(c: canvas.Canvas, width: float, height: float):
-    """Ajoute une page "Ce livre appartient à" """
-    c.setFont("Helvetica-Bold", 24)
-    c.drawCentredString(width / 2, height * 0.7, "Ce livre appartient à:")
-    
-    c.setLineWidth(1)
-    line_y = height * 0.5
-    line_width = width * 0.6
-    line_x_start = (width - line_width) / 2
-    
-    for i in range(3):
-        y = line_y - (i * 50)
-        c.line(line_x_start, y, line_x_start + line_width, y)
-
-
-def add_copyright_page(c: canvas.Canvas, author: str, width: float, height: float):
-    """Ajoute une page de copyright"""
-    import datetime
-    current_year = datetime.datetime.now().year
-    
-    text_y = height * 0.5
-    
-    c.setFont("Helvetica", 12)
-    c.drawCentredString(width / 2, text_y + 40, f"© {current_year} {author}")
-    
-    c.setFont("Helvetica", 10)
-    c.drawCentredString(width / 2, text_y, "Tous droits réservés.")
-    
-    c.setFont("Helvetica", 9)
-    text_lines = [
-        "Aucune partie de ce livre ne peut être reproduite,",
-        "distribuée ou transmise sous quelque forme que ce soit",
-        "sans l'autorisation écrite préalable de l'auteur."
-    ]
-    
-    for i, line in enumerate(text_lines):
-        c.drawCentredString(width / 2, text_y - 40 - (i * 15), line)
-
-
-def add_notice_page(c: canvas.Canvas, width: float, height: float):
-    """Ajoute une page d'avis important"""
-    c.setFont("Helvetica-Bold", 20)
-    c.drawCentredString(width / 2, height * 0.75, "Avis Important")
-    
-    c.setLineWidth(1)
-    c.line(width * 0.2, height * 0.72, width * 0.8, height * 0.72)
-    
-    c.setFont("Helvetica", 11)
-    text_lines = [
-        "Ce livre de coloriage est conçu pour les adultes.",
-        "",
-        "Les images peuvent contenir des détails complexes",
-        "qui ne conviennent pas aux jeunes enfants.",
-        "",
-        "Utilisez des crayons de couleur, des feutres",
-        "ou des stylos adaptés au papier.",
-        "",
-        "Prenez votre temps et profitez du processus créatif !",
-        "",
-        "Bon coloriage !"
-    ]
-    
-    text_y = height * 0.6
-    for i, line in enumerate(text_lines):
-        c.drawCentredString(width / 2, text_y - (i * 20), line)
 
 
 def gouttiere_kdp(nb_pages: int) -> float:
@@ -295,56 +139,27 @@ def create_pdf(urls: List[str], request: PDFRequest):
         logger.info(f"Création PDF format {format_name}: {page_width}x{page_height} points")
         
         pdf_buffer = io.BytesIO()
-        init_font = pages_debut.police_initiale() if request.langues else "Helvetica"
+        init_font = pages_debut.police_initiale()
         c = canvas.Canvas(pdf_buffer, pagesize=(page_width, page_height), initialFontName=init_font)
         
         page_number = 1
-        info = {"pct": "", "polices": "Helvetica (non integree)", "avert": ""}
-        police_num = "Helvetica"
+        # ---- pages de debut v2 : 4 pages, polices integrees
+        nb_img = len(urls)
+        nb_total = 4 + (2 * nb_img - 1 if request.recto_only else nb_img)
+        g_v2 = gouttiere_kdp(nb_total) * inch
+        ext_v2 = request.marge_ext_in * inch
+        def zone(n):
+            if n % 2 == 1:
+                return g_v2, page_width - g_v2 - ext_v2
+            return ext_v2, page_width - g_v2 - ext_v2
+        if not request.year:
+            request.year = str(_dt.date.today().year)
+        nb, pct, pol = pages_debut.generer(c, request, page_width, page_height, zone)
+        page_number += nb
+        police_num = pol.texte["Regular"]
+        info = {"pct": str(pct), "polices": pol.utilisees(),
+                "avert": " ; ".join(pol.avertissements)}
 
-        if request.langues:
-            # ---- pages de debut v2 : 4 pages, polices integrees
-            nb_img = len(urls)
-            nb_total = 4 + (2 * nb_img - 1 if request.recto_only else nb_img)
-            g_v2 = gouttiere_kdp(nb_total) * inch
-            ext_v2 = request.marge_ext_in * inch
-            def zone(n):
-                if n % 2 == 1:
-                    return g_v2, page_width - g_v2 - ext_v2
-                return ext_v2, page_width - g_v2 - ext_v2
-            if not request.year:
-                request.year = str(_dt.date.today().year)
-            nb, pct, pol = pages_debut.generer(c, request, page_width, page_height, zone)
-            page_number += nb
-            police_num = pol.texte["Regular"]
-            info = {"pct": str(pct), "polices": pol.utilisees(),
-                    "avert": " ; ".join(pol.avertissements)}
-
-        # Pages supplémentaires (ancien format, si langues vide)
-        if request.include_title_page and request.title and not request.langues:
-            logger.info("Ajout de la page de titre")
-            add_title_page(c, request.title, request.author, page_width, page_height)
-            c.showPage()
-            page_number += 1
-        
-        if request.include_ownership_page and not request.langues:
-            logger.info("Ajout de la page d'appartenance")
-            add_ownership_page(c, page_width, page_height)
-            c.showPage()
-            page_number += 1
-        
-        if request.include_copyright_page and not request.langues:
-            logger.info("Ajout de la page de copyright")
-            add_copyright_page(c, request.author, page_width, page_height)
-            c.showPage()
-            page_number += 1
-        
-        if request.include_notice_page and not request.langues:
-            logger.info("Ajout de la page d'avis important")
-            add_notice_page(c, page_width, page_height)
-            c.showPage()
-            page_number += 1
-        
         # Images de coloriage
         nb_front = page_number - 1
         nb_img = len(urls)
@@ -460,14 +275,13 @@ async def root():
     """Endpoint racine - Informations sur l'API"""
     return {
         "service": "KDP PDF Generator",
-        "version": "3.8.0 (memoire basse + SVG→PNG)",
+        "version": "3.9.0",
         "status": "operational",
-        "features": ["Téléchargements parallèles", "Conversion SVG→PNG"],
+        "features": ["Pages de debut v2 multilingues", "Memoire basse", "Epaississement /thicken"],
         "formats_supported": list(KDP_FORMATS.keys()),
         "endpoints": {
             "health": "/health",
             "generate": "/generate-pdf (POST)",
-            "svg_to_png": "/svg_to_png (POST)",
             "thicken": "/thicken (POST, multipart)"
         }
     }
@@ -479,7 +293,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "KDP PDF Generator",
-        "version": "3.8.0",
+        "version": "3.9.0",
         "formats_available": list(KDP_FORMATS.keys())
     }
 
@@ -501,16 +315,18 @@ async def generate_pdf(request: PDFRequest):
         logger.info(f"Début de génération PDF: {request.book_id}")
         logger.info(f"Format: {request.format}")
         logger.info(f"Nombre d'images: {len(request.urls)}")
-        logger.info(f"Pages supplémentaires: T={request.include_title_page}, "
-                   f"O={request.include_ownership_page}, "
-                   f"C={request.include_copyright_page}, "
-                   f"N={request.include_notice_page}")
+        logger.info(f"Auteur: {request.author} ; langues: {len(request.langues)}")
         logger.info(f"═══════════════════════════════════════════════")
         
         # Validations
         if not request.urls:
             raise HTTPException(status_code=400, detail="La liste d'URLs ne peut pas être vide")
         
+        if not request.langues:
+            raise HTTPException(status_code=400, detail="'langues' obligatoire (pages de debut v2) : TEXTES_PAGES K2 vide ?")
+        if not request.author.strip():
+            raise HTTPException(status_code=400, detail="'author' vide : remplir Collection_DNA M (AUTEUR)")
+
         if len(request.urls) > 500:
             raise HTTPException(status_code=400, detail="Maximum 500 images par PDF")
         
@@ -555,67 +371,6 @@ async def generate_pdf(request: PDFRequest):
     except Exception as e:
         logger.error(f"Erreur inattendue: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erreur interne du serveur: {str(e)}")
-
-
-@app.post("/svg_to_png")
-async def svg_to_png(request: SVGToPNGRequest):
-    """Convertit un SVG en PNG 300 DPI au format KDP"""
-    
-    logger.info(f"🎨 SVG→PNG: {request.book_id}_{request.image_number}")
-    
-    try:
-        # 1. Télécharger le SVG
-        response = requests.get(request.svg_url, timeout=60, allow_redirects=True)
-        if response.status_code != 200:
-            raise HTTPException(400, f"Erreur téléchargement SVG: {response.status_code}")
-        
-        svg_content = response.content
-        
-        # 2. Calculer dimensions
-        width_px, height_px = get_format_dimensions(request.format, request.dpi)
-        
-        # 3. Convertir SVG → PNG
-        png_data = cairosvg.svg2png(
-            bytestring=svg_content,
-            output_width=width_px,
-            output_height=height_px,
-            dpi=request.dpi
-        )
-        
-        # 4. Optimiser (RGBA → RGB avec fond blanc)
-        img = Image.open(BytesIO(png_data))
-        if img.mode == 'RGBA':
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            background.paste(img, mask=img.split()[3])
-            img = background
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
-        
-        output = BytesIO()
-        img.save(output, format='PNG', optimize=True)
-        final_png = output.getvalue()
-        
-        # 5. Retourner le PNG
-        filename = f"{request.book_id}_{request.image_number}_KDP.png"
-        
-        logger.info(f"✅ SVG→PNG terminé: {filename} ({img.size[0]}x{img.size[1]} @ {request.dpi} DPI)")
-        
-        return Response(
-            content=final_png,
-            media_type="image/png",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "X-Image-Width": str(img.size[0]),
-                "X-Image-Height": str(img.size[1]),
-                "X-Image-DPI": str(request.dpi)
-            }
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Erreur SVG→PNG: {e}")
-        raise HTTPException(500, str(e))
 
 
 @app.post("/thicken")
