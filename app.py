@@ -8,7 +8,6 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
 from pydantic import BaseModel, HttpUrl, Field
 from typing import List, Optional
-import httpx
 import requests
 import os
 from reportlab.pdfgen import canvas
@@ -20,6 +19,9 @@ from io import BytesIO
 import logging
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+import gc
+import resource
 import cairosvg
 import numpy as np
 import cv2
@@ -34,7 +36,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="KDP PDF Generator",
     description="Service de génération de PDFs pour livres de coloriage Amazon KDP - Version Optimisée + SVG→PNG",
-    version="3.7.0"
+    version="3.8.0"
 )
 
 # Formats KDP en inches → points (1 inch = 72 points) pour PDF
@@ -60,8 +62,9 @@ KDP_FORMATS_INCHES = {
     "8.5x8.5": (8.5, 8.5),
 }
 
-# Configuration pour téléchargements parallèles
-MAX_CONCURRENT_DOWNLOADS = 10  # Nombre de téléchargements simultanés
+# Telechargement au fil de l'eau (v3.8.0, 14 nov. 2026) : au plus PREFETCH images
+# en memoire en meme temps (avant : les 43 d'un coup -> depassement des 512 Mo Render)
+PREFETCH = 2
 
 
 # =============================================================================
@@ -85,6 +88,8 @@ class PDFRequest(BaseModel):
     marge_ext_in: float = 0.375       # marge exterieure (KDP mini 0,25 sans fond perdu)
     marge_haut_in: float = 0.375      # marge du haut
     numeroter: bool = True            # numero de page sous le dessin, hors du dessin
+    dpi_impression: int = 300         # resolution integree au PDF (KDP : 300 ppp)
+    niveaux_de_gris: bool = True      # dessins integres en gris (3x plus leger que RGB)
     # --- Pages de debut v2 multilingues (OBSIDIAN, 13 nov. 2026) ---
     # si 'langues' est rempli : 4 pages v2 (titre, copyright, appartient+avis, essai couleurs)
     # et les anciens include_* sont ignores. langues[0] = langue principale (anglais).
@@ -132,83 +137,27 @@ def get_format_dimensions(format_str: str, dpi: int = 300):
     return int(8.27 * dpi), int(11.69 * dpi)
 
 
-async def download_image_async(url: str, index: int, timeout: int = 30) -> tuple[int, bytes]:
-    """
-    Télécharge une image de manière asynchrone
-    
-    Args:
-        url: URL de l'image
-        index: Index de l'image dans la liste
-        timeout: Timeout en secondes
-        
-    Returns:
-        Tuple (index, contenu de l'image en bytes)
-    """
+def telecharger_image(url: str, index: int, timeout: int = 60) -> bytes:
+    """Telecharge une image (synchrone, appele depuis un fil du pool)."""
     try:
-        logger.info(f"[{index}] Téléchargement de l'image: {url}")
-        
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            response = await client.get(url)
-            response.raise_for_status()
-            
-            content_type = response.headers.get('content-type', '')
-            if not content_type.startswith('image/'):
-                logger.warning(f"[{index}] Type de contenu inhabituel: {content_type}")
-            
-            logger.info(f"[{index}] ✓ Image téléchargée: {len(response.content)} bytes")
-            return (index, response.content)
-            
-    except httpx.HTTPStatusError as e:
-        logger.error(f"[{index}] Erreur HTTP {e.response.status_code} pour {url}")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Image {index}: Impossible de télécharger (HTTP {e.response.status_code}): {url}"
-        )
-    except httpx.TimeoutException:
-        logger.error(f"[{index}] Timeout lors du téléchargement de {url}")
-        raise HTTPException(
-            status_code=408,
-            detail=f"Image {index}: Timeout lors du téléchargement: {url}"
-        )
-    except Exception as e:
-        logger.error(f"[{index}] Erreur lors du téléchargement de {url}: {str(e)}")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Image {index}: Erreur lors du téléchargement: {str(e)}"
-        )
+        r = requests.get(url, timeout=timeout, allow_redirects=True)
+        r.raise_for_status()
+    except requests.HTTPError:
+        raise HTTPException(400, f"Image {index + 1}: impossible de telecharger (HTTP {r.status_code}): {url}")
+    except requests.Timeout:
+        raise HTTPException(408, f"Image {index + 1}: delai depasse au telechargement: {url}")
+    except requests.RequestException as e:
+        raise HTTPException(400, f"Image {index + 1}: erreur de telechargement: {e}")
+    ct = r.headers.get("content-type", "")
+    if ct.startswith("text/html"):
+        raise HTTPException(400, f"Image {index + 1}: le lien renvoie une page web, pas une image "
+                                 f"(fichier Drive non partage ou ID faux): {url}")
+    return r.content
 
 
-async def download_images_parallel(urls: List[str]) -> List[bytes]:
-    """
-    Télécharge plusieurs images en parallèle
-    
-    Args:
-        urls: Liste des URLs d'images
-        
-    Returns:
-        Liste des images en bytes (dans le bon ordre)
-    """
-    logger.info(f"Téléchargement parallèle de {len(urls)} images (max {MAX_CONCURRENT_DOWNLOADS} simultanés)")
-    
-    # Créer un semaphore pour limiter les téléchargements concurrents
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
-    
-    async def download_with_semaphore(url: str, index: int):
-        async with semaphore:
-            return await download_image_async(url, index)
-    
-    # Lancer tous les téléchargements en parallèle
-    tasks = [download_with_semaphore(str(url), i) for i, url in enumerate(urls)]
-    results = await asyncio.gather(*tasks)
-    
-    # Trier les résultats par index pour garder l'ordre original
-    results.sort(key=lambda x: x[0])
-    
-    # Extraire seulement les données (pas les index)
-    images_data = [data for _, data in results]
-    
-    logger.info(f"✓ Tous les téléchargements terminés")
-    return images_data
+def memoire_max_mo() -> int:
+    """Pic de memoire du processus depuis son demarrage (Linux : ru_maxrss en Ko)."""
+    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
 
 
 # =============================================================================
@@ -330,17 +279,10 @@ def gouttiere_kdp(nb_pages: int) -> float:
     return 0.875
 
 
-def create_pdf(images_data: List[bytes], request: PDFRequest):
-    """
-    Crée un PDF à partir d'une liste d'images
-    
-    Args:
-        images_data: Liste des images en bytes
-        request: Requête contenant les paramètres du PDF
-        
-    Returns:
-        Contenu du PDF en bytes
-    """
+def create_pdf(urls: List[str], request: PDFRequest):
+    """Cree le PDF en telechargeant les images une a une (memoire basse).
+    Renvoie (pdf_bytes, info)."""
+    pool = ThreadPoolExecutor(max_workers=PREFETCH)
     try:
         format_name = request.format
         if format_name not in KDP_FORMATS:
@@ -362,7 +304,7 @@ def create_pdf(images_data: List[bytes], request: PDFRequest):
 
         if request.langues:
             # ---- pages de debut v2 : 4 pages, polices integrees
-            nb_img = len(images_data)
+            nb_img = len(urls)
             nb_total = 4 + (2 * nb_img - 1 if request.recto_only else nb_img)
             g_v2 = gouttiere_kdp(nb_total) * inch
             ext_v2 = request.marge_ext_in * inch
@@ -405,7 +347,7 @@ def create_pdf(images_data: List[bytes], request: PDFRequest):
         
         # Images de coloriage
         nb_front = page_number - 1
-        nb_img = len(images_data)
+        nb_img = len(urls)
         # premier dessin sur une page impaire (recto) : page blanche si besoin
         pad = 1 if (request.recto_only and page_number % 2 == 0) else 0
         nb_pages = nb_front + pad + (2 * nb_img - 1 if request.recto_only else nb_img)
@@ -422,10 +364,22 @@ def create_pdf(images_data: List[bytes], request: PDFRequest):
             c.showPage()
             page_number += 1
 
+        # file d'attente : PREFETCH telechargements d'avance, pas plus
+        futs = deque()
+        suivant = [0]
+        def lancer():
+            if suivant[0] < nb_img:
+                futs.append(pool.submit(telecharger_image, str(urls[suivant[0]]), suivant[0]))
+                suivant[0] += 1
+        for _ in range(PREFETCH):
+            lancer()
+
         for idx in range(nb_img):
             logger.info(f"Traitement de l'image {idx + 1}/{nb_img}")
-            img = Image.open(io.BytesIO(images_data[idx]))
-            images_data[idx] = None  # liberer la memoire au fur et a mesure
+            data = futs.popleft().result()
+            lancer()
+            img = Image.open(io.BytesIO(data))
+            del data
 
             if img.mode in ('RGBA', 'LA', 'P'):
                 background = Image.new('RGB', img.size, (255, 255, 255))
@@ -433,7 +387,9 @@ def create_pdf(images_data: List[bytes], request: PDFRequest):
                     img = img.convert('RGBA')
                 background.paste(img, mask=img.split()[-1])
                 img = background
-            if img.mode not in ('L', 'RGB'):
+            if request.niveaux_de_gris and img.mode != 'L':
+                img = img.convert('L')
+            elif img.mode not in ('L', 'RGB'):
                 img = img.convert('RGB')
 
             # page impaire = recto : reliure a gauche ; page paire : reliure a droite
@@ -449,6 +405,11 @@ def create_pdf(images_data: List[bytes], request: PDFRequest):
                 logger.warning(f"Image {idx + 1} trop large, reduite a la largeur utile")
                 draw_width = zone_w
                 draw_height = draw_width / ratio
+            # ramener a dpi_impression a la taille imprimee (jamais d'agrandissement)
+            cible_h = round(draw_height / inch * request.dpi_impression)
+            if img.height > cible_h * 1.02:
+                cible_w = round(img.width * cible_h / img.height)
+                img = img.resize((cible_w, cible_h), Image.LANCZOS)
             x = zone_x + (zone_w - draw_width) / 2
             y = bas + (h_cible - draw_height)  # dessin colle a la marge du haut
 
@@ -457,6 +418,8 @@ def create_pdf(images_data: List[bytes], request: PDFRequest):
             del img
             img_buffer.seek(0)
             c.drawImage(ImageReader(img_buffer), x, y, width=draw_width, height=draw_height)
+            del img_buffer
+            gc.collect()
 
             if request.numeroter:
                 c.setFont(police_num, 10)
@@ -475,13 +438,17 @@ def create_pdf(images_data: List[bytes], request: PDFRequest):
         logger.info(f"PDF créé avec succès: {len(pdf_bytes)} bytes, {page_number} pages")
         
         return pdf_bytes, info
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Erreur lors de la création du PDF: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Erreur lors de la création du PDF: {str(e)}"
         )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # =============================================================================
@@ -493,7 +460,7 @@ async def root():
     """Endpoint racine - Informations sur l'API"""
     return {
         "service": "KDP PDF Generator",
-        "version": "3.7.0 (Optimisé + SVG→PNG)",
+        "version": "3.8.0 (memoire basse + SVG→PNG)",
         "status": "operational",
         "features": ["Téléchargements parallèles", "Conversion SVG→PNG"],
         "formats_supported": list(KDP_FORMATS.keys()),
@@ -512,7 +479,7 @@ async def health_check():
     return {
         "status": "healthy",
         "service": "KDP PDF Generator",
-        "version": "3.7.0",
+        "version": "3.8.0",
         "formats_available": list(KDP_FORMATS.keys())
     }
 
@@ -554,28 +521,16 @@ async def generate_pdf(request: PDFRequest):
                        f"Formats disponibles: {', '.join(KDP_FORMATS.keys())}"
             )
         
-        # Télécharger toutes les images EN PARALLÈLE
+        # Telechargement au fil de l'eau + creation du PDF (dans un fil, sans bloquer le serveur)
         import time
         start_time = time.time()
-        
-        images_data = await download_images_parallel(request.urls)
-        
-        download_time = time.time() - start_time
-        logger.info(f"⚡ Téléchargements terminés en {download_time:.2f}s "
-                   f"({len(request.urls) / download_time:.1f} images/sec)")
-        
-        # Générer le PDF
-        pdf_start = time.time()
-        pdf_bytes, info = create_pdf(images_data, request)
-        pdf_time = time.time() - pdf_start
-        
+        loop = asyncio.get_running_loop()
+        pdf_bytes, info = await loop.run_in_executor(None, create_pdf, request.urls, request)
         total_time = time.time() - start_time
-        
+
         logger.info(f"═══════════════════════════════════════════════")
         logger.info(f"✓ PDF généré avec succès: {request.book_id}")
-        logger.info(f"  Temps téléchargements: {download_time:.2f}s")
-        logger.info(f"  Temps création PDF: {pdf_time:.2f}s")
-        logger.info(f"  Temps TOTAL: {total_time:.2f}s")
+        logger.info(f"  Temps TOTAL: {total_time:.2f}s ; memoire max {memoire_max_mo()} Mo")
         logger.info(f"  Taille PDF: {len(pdf_bytes) / 1024 / 1024:.2f} MB")
         logger.info(f"═══════════════════════════════════════════════")
         
@@ -586,6 +541,9 @@ async def generate_pdf(request: PDFRequest):
                 'Content-Disposition': f'attachment; filename="{request.book_id}.pdf"',
                 'X-PDF-Recto-Seul': str(request.recto_only),
                 'X-PDF-Hauteur-Dessin-In': str(request.hauteur_dessin_in),
+                'X-PDF-DPI': str(request.dpi_impression),
+                'X-PDF-Duree-s': f"{total_time:.1f}",
+                'X-PDF-Memoire-Max-Mo': str(memoire_max_mo()),
                 'X-PDF-Langue-Principale-Pct': info["pct"],
                 'X-PDF-Polices': info["polices"],
                 'X-PDF-Avertissements': info["avert"].encode("ascii", "replace").decode()[:900],
